@@ -1,0 +1,40 @@
+services:
+  app:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      APP_DB_PATH: /data/pathology.sqlite3
+      RECEIVER_URL: http://receiver:8000
+      RECONCILE_ON_START: "1"
+    volumes:
+      - app-data:/data
+    depends_on:
+      - receiver
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  receiver:
+    build: .
+    command: uvicorn receiver.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8001:8000"
+    environment:
+      RECEIVER_DB_PATH: /data/receiver.sqlite3
+      RECEIVER_DECISION: accept
+      RECEIVER_FAULT: none
+    volumes:
+      - receiver-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  app-data:
+  receiver-data:

@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>病理切片名单划分与交付</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>病理切片名单划分与交付</h1>
+  <p class="sub">同患者 / 同一重复图组的切片必须同集；测试名单按全库精确划分；训练名单交付独立接收服务。</p>
+</header>
+
+{% if flash %}<div class="banner ok">{{ flash }}</div>{% endif %}
+{% if error %}<div class="banner err">{{ error }}</div>{% endif %}
+
+<main>
+<section class="card">
+  <h2>1. 切片总库</h2>
+  <p class="meta">
+    共 <b>{{ slides|length }}</b> / {{ max_slides }} 条 ·
+    良性 {{ benign }} 张、恶性 {{ malignant }} 张 ·
+    当前可入测试：良性 {{ eligible_benign }} 张、恶性 {{ eligible_malignant }} 张 ·
+    被禁入 {{ barred_count }} 张 ·
+    {{ groups|length }} 个传递连通组
+  </p>
+  <form class="upload" method="post" action="/upload" enctype="multipart/form-data">
+    <label>CSV 文件 <input type="file" name="file" accept=".csv,text/csv"></label>
+    <label>首行
+      <select name="has_header">
+        <option value="1" selected>是表头</option>
+        <option value="0">无表头</option>
+      </select>
+    </label>
+    <label class="full">或粘贴 CSV（列：slide_id,patient_id,repeat_group,malignancy；repeat_group 可空）<br>
+      <textarea name="text" rows="4" placeholder="S001,P001,G1,benign&#10;S002,P001,,malignant&#10;S003,P002,G1,benign"></textarea>
+    </label>
+    <button type="submit">追加到总库</button>
+  </form>
+  {% if slides %}
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>#</th><th>切片号</th><th>患者号</th><th>重复图组</th><th>良恶性</th><th>当前状态</th></tr></thead>
+    <tbody>
+    {% for s in slides %}
+      <tr class="{% if s.slide_id in restriction_reasons %}barred{% endif %}">
+        <td>{{ loop.index }}</td>
+        <td>{{ s.slide_id }}</td>
+        <td>{{ s.patient_id }}</td>
+        <td>{{ s.repeat_group or '—' }}</td>
+        <td>{{ '良性' if s.malignancy == 'benign' else '恶性' }}</td>
+        <td>{% if s.slide_id in restriction_reasons %}<span class="tag bad">禁入测试</span><small>{{ restriction_reasons[s.slide_id] }}</small>{% else %}<span class="tag good">可入测试</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty">库为空，请先上传 CSV。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>2. 精确划分并发布名单</h2>
+  <p class="meta">指定测试集良性与恶性切片数量，其余全部进训练集；按全库、按完整连通组精确求解，无解时给出原因。</p>
+  <form method="post" action="/plans" class="row">
+    <label>测试集良性张数 <input type="number" name="benign_count" min="0" value="0" required></label>
+    <label>测试集恶性张数 <input type="number" name="malignant_count" min="0" value="0" required></label>
+    <button type="submit">求解并发布名单</button>
+  </form>
+  {% if plans %}
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>名单</th><th>状态</th><th>测试(良+恶)</th><th>训练</th><th>校验和</th><th>下载</th><th>训练名单交付</th></tr></thead>
+    <tbody>
+    {% for p in plans %}
+      <tr>
+        <td>#{{ p.id }}<br><small>{{ p.created_at }}</small></td>
+        <td>
+          {% if p.status == 'valid' %}<span class="tag good">隔离有效</span>
+          {% else %}<span class="tag bad">隔离失效·停供</span><br><small class="why">{{ p.status_reason }}</small>{% endif %}
+          <br><small>求解快照校验 {{ p.snapshot_fingerprint[:10] }}…</small>
+        </td>
+        <td>{{ p.test_benign }} + {{ p.test_malignant }} = {{ p.test_count }}<br><small>训练 {{ p.train_count }}</small><br><small>{{ p.test_count + p.train_count }} 张 / 全库 {{ slides|length }}</small></td>
+        <td>{{ p.train_count }} 张</td>
+        <td><code>{{ p.checksum[:16] }}…</code></td>
+        <td>
+          {% if p.status == 'valid' %}
+            <a class="btn" href="/plans/{{ p.id }}/download/test">下载测试名单</a>
+            <a class="btn" href="/plans/{{ p.id }}/download/train">下载训练名单</a>
+          {% else %}
+            <span class="tag bad">暂停下载</span>
+          {% endif %}
+        </td>
+        <td>
+          <form method="post" action="/plans/{{ p.id }}/deliver"><button {% if p.status != 'valid' %}disabled{% endif %}>交付训练名单</button></form>
+          {% for d in p.deliveries %}
+            <div class="dline">
+              <code title="{{ d.id }}">{{ d.id[:14] }}…</code>
+              <span class="tag {{ 'good' if d.status == 'accepted' else ('bad' if d.status == 'rejected' else 'warn') }}">{{ {'accepted':'接纳','rejected':'拒收','pending':'待核实'}[d.status] }}</span>
+              {% if d.status == 'pending' %}
+                <form method="post" action="/deliveries/{{ d.id }}/verify"><button class="small">核实</button></form>
+                <form method="post" action="/deliveries/{{ d.id }}/retry"><button class="small">重试发送</button></form>
+              {% endif %}
+              {% if d.receipt_ref %}<small>回执 {{ d.receipt_ref }}</small>{% endif %}
+              {% if d.last_error %}<small class="why">{{ d.last_error }}</small>{% endif %}
+            </div>
+          {% endfor %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>3. 交付与接收服务</h2>
+  <p class="meta">发送前先落库“待核实”；只有接收服务返回固定回执号的确认才转为终态。查无记录 / 超时 / 非 2xx 一律视为未明，切片继续暂禁入测试。</p>
+  <form method="post" action="/settings" class="row">
+    <label>接收服务地址 <input type="text" name="receiver_url" value="{{ settings.get('receiver_url','') }}" size="34"></label>
+    <button type="submit">保存</button>
+  </form>
+  {% if deliveries %}
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>交付号</th><th>名单</th><th>张数</th><th>状态</th><th>接收方状态</th><th>回执</th><th>最近检查</th></tr></thead>
+    <tbody>
+    {% for d in deliveries %}
+    <tr>
+      <td><code>{{ d.id }}</code></td>
+      <td>#{{ d.plan_id }} / {{ d.split }}</td>
+      <td>{{ d.slide_count }}</td>
+      <td><span class="tag {{ 'good' if d.status == 'accepted' else ('bad' if d.status == 'rejected' else 'warn') }}">{{ {'accepted':'接纳','rejected':'拒收','pending':'待核实'}[d.status] }}</span>
+        {% if d.status == 'pending' %}
+          <form method="post" action="/deliveries/{{ d.id }}/verify"><button class="small">核实</button></form>
+          <form method="post" action="/deliveries/{{ d.id }}/retry"><button class="small">重试</button></form>
+        {% endif %}
+      </td>
+      <td>{{ d.receiver_status }}{% if d.last_error %}<br><small class="why">{{ d.last_error }}</small>{% endif %}</td>
+      <td>{% if d.receipt_ref %}<code>{{ d.receipt_ref }}</code>{% else %}—{% endif %}</td>
+      <td><small>{{ d.last_checked_at or '—' }}</small></td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>4. 操作记录</h2>
+  <ul class="events">
+    {% for e in events %}<li><small>{{ e.created_at }}</small> <span class="kind">{{ e.kind }}</span> {{ e.message }}</li>{% endfor %}
+  </ul>
+</section>
+</main>
+</body>
+</html>
