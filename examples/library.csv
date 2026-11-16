@@ -1,0 +1,13 @@
+slide_id,patient_id,repeat_group,malignancy
+S001,P001,G1,benign
+S002,P002,G1,malignant
+S003,P001,,benign
+S004,P004,,benign
+S005,P005,G5,malignant
+S006,P006,G5,malignant
+S007,P007,,benign
+S008,P008,,malignant
+S009,P009,,benign
+S010,P010,,malignant
+S011,P011,,benign
+S012,P012,,malignant
