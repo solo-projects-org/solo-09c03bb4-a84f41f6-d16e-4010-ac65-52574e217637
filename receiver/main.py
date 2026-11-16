@@ -32,6 +32,7 @@ DB_PATH = os.environ.get("RECEIVER_DB_PATH", "/data/receiver.sqlite3")
 DEFAULT_DECISION = os.environ.get("RECEIVER_DECISION", "accept")
 DEFAULT_FAULT = os.environ.get("RECEIVER_FAULT", "none")
 DEFAULT_DELAY = float(os.environ.get("RECEIVER_FAULT_DELAY", "3.0"))
+DEFAULT_NAME = os.environ.get("RECEIVER_NAME", "receiver")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -94,7 +95,36 @@ def connect() -> sqlite3.Connection:
     conn.execute(
         "INSERT OR IGNORE INTO controls(key, value) VALUES ('refuse', '0')"
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO controls(key, value) VALUES ('name', ?)", (DEFAULT_NAME,)
+    )
+    # The receiver id is generated once and lives in this data volume. It is
+    # therefore stable across restarts but different for a fresh/replaced
+    # volume mounted at the same address. Senders bind deliveries to it.
+    conn.execute(
+        "INSERT OR IGNORE INTO controls(key, value) VALUES ('receiver_id', ?)",
+        ("RCV-" + secrets.token_hex(10).upper(),),
+    )
     return conn
+
+
+def receiver_identity(conn: sqlite3.Connection | None = None) -> dict[str, str]:
+    own = conn is None
+    conn = conn or connect()
+    try:
+        rows = {
+            r["key"]: r["value"]
+            for r in conn.execute(
+                "SELECT key, value FROM controls WHERE key IN ('receiver_id', 'name')"
+            )
+        }
+    finally:
+        if own:
+            conn.close()
+    return {
+        "receiver_id": rows.get("receiver_id", ""),
+        "name": rows.get("name") or DEFAULT_NAME,
+    }
 
 
 def controls() -> dict[str, str]:
@@ -160,10 +190,17 @@ def _public(row: sqlite3.Row | dict, include_slides: bool = True) -> dict:
         "comment": data["comment"],
         "created_at": data["created_at"],
         "slide_count": data["slide_count"],
+        "receiver_id": receiver_identity()["receiver_id"],
     }
     if include_slides:
         out["slides"] = json.loads(data["slides_json"])
     return out
+
+
+@app.get("/api/identity")
+def identity():
+    """Identity of this receiving volume (stable across restarts)."""
+    return receiver_identity()
 
 
 @app.get("/api/deliveries/{delivery_id}")
@@ -176,12 +213,13 @@ def get_delivery(delivery_id: str):
         row = conn.execute(
             "SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,)
         ).fetchone()
+        ident = receiver_identity(conn)
     finally:
         conn.close()
     log_request("GET", f"/api/deliveries/{delivery_id}", delivery_id, "verify")
     if not row:
         raise HTTPException(status_code=404, detail="查无记录")
-    return _public(row)
+    return {**_public(row), "receiver_id": ident["receiver_id"], "name": ident["name"]}
 
 
 @app.post("/api/deliveries")
@@ -218,6 +256,20 @@ async def post_delivery(request: Request):
         return JSONResponse(
             {"detail": "校验和不匹配，请求被拒", "computed": computed}, status_code=409
         )
+    expected_receiver_id = str(body.get("expected_receiver_id") or "").strip()
+    own_id = receiver_identity()["receiver_id"]
+    if expected_receiver_id and expected_receiver_id != own_id:
+        log_request(
+            "POST", "/api/deliveries", delivery_id, "receiver identity mismatch"
+        )
+        return JSONResponse(
+            {
+                "detail": "该交付绑定到另一个接收方；本数据卷不是原接收方，拒绝接收。",
+                "receiver_id": own_id,
+                "expected_receiver_id": expected_receiver_id,
+            },
+            status_code=409,
+        )
 
     conn = connect()
     try:
@@ -234,11 +286,12 @@ async def post_delivery(request: Request):
                         "detail": "该交付号已绑定不同内容，拒绝覆盖",
                         "receipt_ref": existing["receipt_ref"],
                         "status": existing["status"],
+                        "receiver_id": own_id,
                     },
                     status_code=409,
                 )
             log_request("POST", "/api/deliveries", delivery_id, "idempotent replay")
-            return JSONResponse(_public(existing))
+            return JSONResponse({**_public(existing), "receiver_id": own_id})
         status = (
             "rejected"
             if cfg.get("refuse") == "1" or cfg.get("decision") == "reject"
@@ -290,6 +343,7 @@ async def post_delivery(request: Request):
             "receipt_ref": receipt_ref,
             "comment": comment,
             "created_at": now(),
+            "receiver_id": own_id,
         },
         status_code=201,
     )
@@ -378,19 +432,21 @@ def home():
         f"<option value='{f}' {'selected' if f == cfg.get('fault') else ''}>{f}</option>"
         for f in sorted(VALID_FAULTS)
     )
+    identity = receiver_identity()
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>独立接收服务</title><style>
+<title>独立接收服务 {identity['name']}</title><style>
 body{{font-family:system-ui,"Noto Sans SC",sans-serif;margin:32px;color:#1d2330;line-height:1.5}}
 table{{border-collapse:collapse;font-size:13px;margin-bottom:20px}}
 td,th{{border-bottom:1px solid #e3e6ec;padding:6px 10px;text-align:left;vertical-align:top}}
 .accepted{{color:#146c3c}}.rejected{{color:#9c2020}}
 code{{font-size:11px;background:#f3f4f7;padding:1px 4px;border-radius:4px}}
 form{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:13px;margin-bottom:18px}}
-button{{padding:4px 12px;border-radius:6px;border:1px solid #1f5eff;background:#1f5eff;color:#fff;cursor:pointer}}
+button{{padding:4px 12px;border:1px solid #1f5eff;border-radius:6px;background:#1f5eff;color:#fff;cursor:pointer}}
 ul{{font-size:12px;color:#3a4353}}
 </style></head><body>
-<h1>独立接收服务</h1>
-<p>终态接纳 / 拒收一经写入不可更改；同一交付号重复提交仅返回原回执，不重复接纳。</p>
+<h1>独立接收服务 {identity['name']}</h1>
+<p>数据卷身份 <code>{identity['receiver_id']}</code>：只接受绑定到本身份的交付；
+同一交付号重复提交仅返回原回执，不重复接纳；终态不可更改。</p>
 <p>当前控制项：故障注入 <b>{cfg.get('fault')}</b>，延迟 {cfg.get('delay')}s，
 拒收模式 <b>{'开' if cfg.get('refuse') == '1' else '关'}</b>。</p>
 <form method="post" action="/simulate-form">

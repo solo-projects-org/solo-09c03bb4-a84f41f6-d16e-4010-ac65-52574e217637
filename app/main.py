@@ -159,9 +159,18 @@ async def upload(
 
 @app.post("/settings")
 def update_settings(conn=Db, receiver_url: str = Form(...)):
+    url = receiver_url.strip()
     with storage.transaction(conn):
-        storage.set_setting(conn, "receiver_url", receiver_url.strip())
-        storage.log_event(conn, "settings", f"接收服务地址设为 {receiver_url.strip()}。")
+        old = storage.get_setting(conn, "receiver_url", "")
+        storage.set_setting(conn, "receiver_url", url)
+        storage.log_event(conn, "settings", f"接收服务地址设为 {url}。")
+    if old and old != url:
+        return _redirect(
+            flash=(
+                f"接收服务地址已从 {old} 改为 {url}。只影响此后新登记的交付；"
+                "库中已有交付仍只由其原接收方核实/接续，不会被转发给新地址。"
+            )
+        )
     return _redirect(flash="接收服务地址已保存。")
 
 
@@ -222,6 +231,8 @@ def deliver(conn=Db, plan_id: int = 0):
 def verify(conn=Db, delivery_id: str = ""):
     try:
         res = service.verify_delivery(conn, delivery_id, _receiver_url(conn))
+    except service.ReceiverOwnershipError as exc:
+        return _redirect(error=str(exc))
     except service.ServiceError as exc:
         return _redirect(error=str(exc))
     return _redirect(flash=res["message"])
@@ -231,6 +242,8 @@ def verify(conn=Db, delivery_id: str = ""):
 def retry(conn=Db, delivery_id: str = ""):
     try:
         res = service.retry_delivery(conn, delivery_id, _receiver_url(conn))
+    except service.ReceiverOwnershipError as exc:
+        return _redirect(error=str(exc))
     except service.ServiceError as exc:
         return _redirect(error=str(exc))
     return _redirect(flash=res["message"])
@@ -254,6 +267,7 @@ def api_restrictions(conn=Db):
     return {
         "accepted": sorted(state.accepted),
         "uncertain": sorted(state.uncertain),
+        "unproven": sorted(state.unproven),
         "barred": sorted(state.barred),
         "reasons": {
             sid: {"code": r.code, "detail": r.detail}

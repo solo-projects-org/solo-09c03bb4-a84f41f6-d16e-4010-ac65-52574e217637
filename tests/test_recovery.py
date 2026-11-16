@@ -50,19 +50,40 @@ def _wire(monkeypatch, fault="none", refuse=False):
         "/api/simulate",
         json={"fault": fault, "refuse": "1" if refuse else "0", "delay": "0.01"},
     )
+    identity = recv.get("/api/identity").json()["receiver_id"]
 
-    def send(receiver_url, delivery_id, checksum, slides, timeout=10.0):
-        resp = recv.post(
-            "/api/deliveries",
-            json={"delivery_id": delivery_id, "checksum": checksum, "slides": slides},
-        )
+    def fetch_identity(receiver_url, timeout=10.0):
+        return identity
+
+    def send(
+        receiver_url,
+        delivery_id,
+        checksum,
+        slides,
+        timeout=10.0,
+        expected_receiver_id=None,
+    ):
+        payload = {
+            "delivery_id": delivery_id,
+            "checksum": checksum,
+            "slides": slides,
+        }
+        if expected_receiver_id:
+            payload["expected_receiver_id"] = expected_receiver_id
+        resp = recv.post("/api/deliveries", json=payload)
         if resp.status_code not in (200, 201):
             return receiver_client.DeliveryOutcome(
                 state="unknown", error=f"HTTP {resp.status_code}", http_status=resp.status_code
             )
         return receiver_client._normalise(resp.json(), checksum)
 
-    def query(receiver_url, delivery_id, expected_checksum=None, timeout=10.0):
+    def query(
+        receiver_url,
+        delivery_id,
+        expected_checksum=None,
+        timeout=10.0,
+        expected_receiver_id=None,
+    ):
         resp = recv.get(f"/api/deliveries/{delivery_id}")
         if resp.status_code == 404:
             return receiver_client.DeliveryOutcome(state="unknown", error="查无记录", http_status=404)
@@ -70,10 +91,15 @@ def _wire(monkeypatch, fault="none", refuse=False):
             return receiver_client.DeliveryOutcome(
                 state="unknown", error=f"HTTP {resp.status_code}", http_status=resp.status_code
             )
-        return receiver_client._normalise(resp.json(), expected_checksum or "")
+        data = resp.json()
+        if expected_receiver_id and data.get("receiver_id") != expected_receiver_id:
+            return receiver_client.DeliveryOutcome(state="unknown", error="接收方身份不一致")
+        return receiver_client._normalise(data, expected_checksum or "")
 
+    monkeypatch.setattr(receiver_client, "fetch_identity", fetch_identity)
     monkeypatch.setattr(receiver_client, "send_delivery", send)
     monkeypatch.setattr(receiver_client, "query_delivery", query)
+    monkeypatch.setattr(service.receiver_client, "fetch_identity", fetch_identity)
     monkeypatch.setattr(service.receiver_client, "send_delivery", send)
     monkeypatch.setattr(service.receiver_client, "query_delivery", query)
     return recv
@@ -91,6 +117,16 @@ def test_crash_before_post_leaves_verifiable_pending(env, monkeypatch):
     """The process dies after the pending row but before the POST."""
     app_db, _ = env
     conn, plan_id = _seed(app_db)
+    recv_db = env[1]
+    import receiver.main as rm
+
+    rm.DB_PATH = recv_db
+
+    recv = TestClient(receiver_app)
+    identity = recv.get("/api/identity").json()["receiver_id"]
+    monkeypatch.setattr(
+        service.receiver_client, "fetch_identity", lambda url, timeout=10.0: identity
+    )
 
     def boom(*args, **kwargs):
         raise KeyboardInterrupt("simulated crash during POST")
@@ -102,13 +138,17 @@ def test_crash_before_post_leaves_verifiable_pending(env, monkeypatch):
     pending = [d for d in storage.list_deliveries(conn) if d["status"] == "pending"]
     assert len(pending) == 1
     pid = pending[0]["id"]
+    assert pending[0]["receiver_id"] == identity
     # restriction survived: slides of that delivery are barred from test
     state = service.current_restrictions(conn)
     assert set(storage.delivery_slide_ids(conn, pid)) <= state.uncertain
     conn.close()
 
     # "restart": new connection, reconcile against a receiver that has no record
-    recv = _wire(monkeypatch, fault="none")
+    _wire(monkeypatch, fault="none")
+    monkeypatch.setattr(
+        receiver_client, "fetch_identity", lambda url, timeout=10.0: identity
+    )
     conn2 = storage.connect(app_db)
     results = service.reconcile_pending(conn2, "http://receiver")
     assert results and results[0]["delivery"]["status"] == "pending"  # 404 => unknown
@@ -125,16 +165,32 @@ def test_crash_after_receiver_store_before_local_commit(env, monkeypatch):
     app_db, _ = env
     conn, plan_id = _seed(app_db)
 
-    def crash_after_send(receiver_url, delivery_id, checksum, slides, timeout=10.0):
+    def crash_after_send(
+        receiver_url,
+        delivery_id,
+        checksum,
+        slides,
+        timeout=10.0,
+        expected_receiver_id=None,
+    ):
         # perform the real POST through the receiver ASGI app, then "crash"
         recv = TestClient(receiver_app)
-        recv.post(
-            "/api/deliveries",
-            json={"delivery_id": delivery_id, "checksum": checksum, "slides": slides},
-        )
+        payload = {
+            "delivery_id": delivery_id,
+            "checksum": checksum,
+            "slides": slides,
+        }
+        if expected_receiver_id:
+            payload["expected_receiver_id"] = expected_receiver_id
+        recv.post("/api/deliveries", json=payload)
         raise KeyboardInterrupt("simulated crash after receiver stored the delivery")
 
     monkeypatch.setattr(service.receiver_client, "send_delivery", crash_after_send)
+    recv_probe = TestClient(receiver_app)
+    identity = recv_probe.get("/api/identity").json()["receiver_id"]
+    monkeypatch.setattr(
+        service.receiver_client, "fetch_identity", lambda url, timeout=10.0: identity
+    )
     with pytest.raises(KeyboardInterrupt):
         service.start_delivery(conn, plan_id, "http://receiver")
     pending = [d for d in storage.list_deliveries(conn) if d["status"] == "pending"]
@@ -147,11 +203,20 @@ def test_crash_after_receiver_store_before_local_commit(env, monkeypatch):
     assert stored.status_code == 200
     receipt = stored.json()["receipt_ref"]
 
-    def query(receiver_url, delivery_id, expected_checksum=None, timeout=10.0):
+    def query(
+        receiver_url,
+        delivery_id,
+        expected_checksum=None,
+        timeout=10.0,
+        expected_receiver_id=None,
+    ):
         resp = recv.get(f"/api/deliveries/{delivery_id}")
         if resp.status_code == 404:
             return receiver_client.DeliveryOutcome(state="unknown", error="查无记录")
-        return receiver_client._normalise(resp.json(), expected_checksum or "")
+        data = resp.json()
+        if expected_receiver_id and data.get("receiver_id") != expected_receiver_id:
+            return receiver_client.DeliveryOutcome(state="unknown", error="接收方身份不一致")
+        return receiver_client._normalise(data, expected_checksum or "")
 
     monkeypatch.setattr(receiver_client, "query_delivery", query)
     monkeypatch.setattr(service.receiver_client, "query_delivery", query)

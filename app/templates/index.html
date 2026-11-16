@@ -99,7 +99,12 @@
             <div class="dline">
               <code title="{{ d.id }}">{{ d.id[:14] }}…</code>
               <span class="tag {{ 'good' if d.status == 'accepted' else ('bad' if d.status == 'rejected' else 'warn') }}">{{ {'accepted':'接纳','rejected':'拒收','pending':'待核实'}[d.status] }}</span>
-              {% if d.status == 'pending' %}
+              {% if d.binding == 'legacy_unproven' %}
+                <span class="tag bad">旧记录·接收方不明</span>
+              {% elif d.receiver_id %}
+                <small>原接收方 <code title="{{ d.receiver_id }}">{{ d.receiver_id[:12] }}…</code></small>
+              {% endif %}
+              {% if d.status == 'pending' and d.binding != 'legacy_unproven' %}
                 <form method="post" action="/deliveries/{{ d.id }}/verify"><button class="small">核实</button></form>
                 <form method="post" action="/deliveries/{{ d.id }}/retry"><button class="small">重试发送</button></form>
               {% endif %}
@@ -118,15 +123,16 @@
 
 <section class="card">
   <h2>3. 交付与接收服务</h2>
-  <p class="meta">发送前先落库“待核实”；只有接收服务返回固定回执号的确认才转为终态。查无记录 / 超时 / 非 2xx 一律视为未明，切片继续暂禁入测试。</p>
+  <p class="meta">发送前先落库“待核实”；只有接收服务返回固定回执号的确认才转为终态。查无记录 / 超时 / 非 2xx 一律视为未明，切片继续暂禁入测试。
+    <b>每笔交付在发送前即绑定原接收方的数据卷身份；改地址或同址换卷都不会把旧交付转给替代方。</b></p>
   <form method="post" action="/settings" class="row">
-    <label>接收服务地址 <input type="text" name="receiver_url" value="{{ settings.get('receiver_url','') }}" size="34"></label>
+    <label>接收服务地址（仅用于此后新交付） <input type="text" name="receiver_url" value="{{ settings.get('receiver_url','') }}" size="34"></label>
     <button type="submit">保存</button>
   </form>
   {% if deliveries %}
   <div class="tablewrap">
   <table>
-    <thead><tr><th>交付号</th><th>名单</th><th>张数</th><th>状态</th><th>接收方状态</th><th>回执</th><th>最近检查</th></tr></thead>
+    <thead><tr><th>交付号</th><th>名单</th><th>张数</th><th>状态</th><th>原接收方 / 卷</th><th>接收方状态</th><th>回执</th><th>最近检查</th></tr></thead>
     <tbody>
     {% for d in deliveries %}
     <tr>
@@ -134,9 +140,21 @@
       <td>#{{ d.plan_id }} / {{ d.split }}</td>
       <td>{{ d.slide_count }}</td>
       <td><span class="tag {{ 'good' if d.status == 'accepted' else ('bad' if d.status == 'rejected' else 'warn') }}">{{ {'accepted':'接纳','rejected':'拒收','pending':'待核实'}[d.status] }}</span>
-        {% if d.status == 'pending' %}
+        {% if d.binding == 'legacy_unproven' %}
+          <span class="tag bad">旧记录·接收方不明</span>
+        {% elif d.status == 'pending' %}
           <form method="post" action="/deliveries/{{ d.id }}/verify"><button class="small">核实</button></form>
           <form method="post" action="/deliveries/{{ d.id }}/retry"><button class="small">重试</button></form>
+        {% endif %}
+      </td>
+      <td>
+        {% if d.receiver_id %}
+          <small><code title="{{ d.receiver_id }}">{{ d.receiver_id[:14] }}…</code></small><br>
+          <small>{{ d.receiver_url or '—' }}</small>
+        {% elif d.binding == 'legacy_unproven' %}
+          <small class="why">旧库无法证明接收方，禁止向其转发</small>
+        {% else %}
+          <small>尚未绑定</small>
         {% endif %}
       </td>
       <td>{{ d.receiver_status }}{% if d.last_error %}<br><small class="why">{{ d.last_error }}</small>{% endif %}</td>

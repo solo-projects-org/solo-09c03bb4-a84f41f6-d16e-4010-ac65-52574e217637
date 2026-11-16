@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS deliveries (
     attempt INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
     receiver_status TEXT NOT NULL DEFAULT 'unknown',
+    receiver_id TEXT,
+    receiver_url TEXT,
+    binding TEXT NOT NULL DEFAULT 'unbound'
+        CHECK (binding IN ('unbound', 'bound', 'legacy_unproven')),
     receipt_ref TEXT,
     receipt_json TEXT,
     created_at TEXT NOT NULL,
@@ -139,6 +143,7 @@ def init_db(path: str) -> None:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = FULL")
             conn.executescript(SCHEMA)
+            _migrate(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES ('receiver_url', ?)",
                 (os.environ.get("RECEIVER_URL", "http://receiver:8000"),),
@@ -146,6 +151,34 @@ def init_db(path: str) -> None:
         finally:
             conn.close()
         _initialized.add(path)
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add the receiver-ownership columns to databases created by older builds.
+
+    Rows that predate receiver identity cannot prove which receiving service
+    they were sent to. They are marked ``legacy_unproven``: an accepted row
+    keeps its permanent test ban, while an unconfirmed or rejected legacy row
+    is *not* allowed to lift a restriction (see ``service.restriction_sets``).
+    """
+    cols = _columns(conn, "deliveries")
+    if "receiver_id" not in cols:
+        conn.execute("ALTER TABLE deliveries ADD COLUMN receiver_id TEXT")
+    if "receiver_url" not in cols:
+        conn.execute("ALTER TABLE deliveries ADD COLUMN receiver_url TEXT")
+    if "binding" not in cols:
+        # Existing rows become 'legacy_unproven' through the column default.
+        conn.execute(
+            "ALTER TABLE deliveries ADD COLUMN binding TEXT NOT NULL "
+            "DEFAULT 'legacy_unproven'"
+        )
+        conn.execute(
+            "UPDATE deliveries SET binding='legacy_unproven' WHERE binding IS NULL"
+        )
 
 
 def connect(path: str | None = None) -> sqlite3.Connection:
@@ -374,11 +407,26 @@ def insert_delivery(
     attempt: int,
     rows: list[dict[str, Any]],
     created_at: str | None = None,
+    receiver_id: str | None = None,
+    receiver_url: str | None = None,
+    binding: str = "unbound",
 ) -> None:
     conn.execute(
         "INSERT INTO deliveries(id, plan_id, split, checksum, slide_count, attempt, "
-        "status, receiver_status, created_at) VALUES (?,?,?,?,?,?,'pending','unknown',?)",
-        (delivery_id, plan_id, split, checksum, len(rows), attempt, created_at or now()),
+        "status, receiver_status, receiver_id, receiver_url, binding, created_at) "
+        "VALUES (?,?,?,?,?,?,'pending','unknown',?,?,?,?)",
+        (
+            delivery_id,
+            plan_id,
+            split,
+            checksum,
+            len(rows),
+            attempt,
+            receiver_id,
+            receiver_url,
+            binding,
+            created_at or now(),
+        ),
     )
     conn.executemany(
         "INSERT INTO delivery_slides(delivery_id, slide_id, patient_id, repeat_group, malignancy) "
@@ -394,6 +442,28 @@ def insert_delivery(
             for r in rows
         ],
     )
+
+
+def bind_delivery(
+    conn: sqlite3.Connection, delivery_id: str, receiver_id: str, receiver_url: str
+) -> bool:
+    """Bind an unbound delivery to the receiver that actually receives it.
+
+    Conditional on ``binding='unbound'`` so two concurrent first sends can
+    never overwrite an established owner. Returns True when this call did the
+    binding (or the row was already bound to the same receiver).
+    """
+    cursor = conn.execute(
+        "UPDATE deliveries SET receiver_id=?, receiver_url=?, binding='bound' "
+        "WHERE id=? AND binding='unbound'",
+        (receiver_id, receiver_url, delivery_id),
+    )
+    if cursor.rowcount == 1:
+        return True
+    row = conn.execute(
+        "SELECT receiver_id, binding FROM deliveries WHERE id=?", (delivery_id,)
+    ).fetchone()
+    return bool(row and row["binding"] == "bound" and row["receiver_id"] == receiver_id)
 
 
 def get_delivery(conn: sqlite3.Connection, delivery_id: str) -> dict[str, Any] | None:
@@ -452,12 +522,20 @@ def set_delivery_terminal(
     receiver_status: str,
     receipt_ref: str | None,
     receipt_json: str | None,
-) -> None:
-    conn.execute(
+) -> bool:
+    """Write the terminal state only while the row is still pending.
+
+    Returns False when another concurrent worker already wrote a terminal
+    state. The first terminal fact wins; a late or duplicate reply can never
+    flip it (e.g. accepted -> rejected), so a training exposure is never lost.
+    """
+    cursor = conn.execute(
         "UPDATE deliveries SET status=?, receiver_status=?, last_checked_at=?, "
-        "last_error=NULL, receipt_ref=?, receipt_json=? WHERE id=?",
+        "last_error=NULL, receipt_ref=?, receipt_json=? "
+        "WHERE id=? AND status='pending'",
         (status, receiver_status, now(), receipt_ref, receipt_json, delivery_id),
     )
+    return cursor.rowcount == 1
 
 
 def touch_delivery(
@@ -467,8 +545,10 @@ def touch_delivery(
     receiver_status: str,
     error: str | None,
 ) -> None:
+    """Record an inconclusive check; never touches a terminal row."""
     conn.execute(
-        "UPDATE deliveries SET receiver_status=?, last_checked_at=?, last_error=? WHERE id=?",
+        "UPDATE deliveries SET receiver_status=?, last_checked_at=?, last_error=? "
+        "WHERE id=? AND status='pending'",
         (receiver_status, now(), error, delivery_id),
     )
 

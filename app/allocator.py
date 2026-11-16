@@ -114,6 +114,7 @@ class Restriction:
 class RestrictionState:
     accepted: set[str] = field(default_factory=set)
     uncertain: set[str] = field(default_factory=set)
+    unproven: set[str] = field(default_factory=set)
     barred: set[str] = field(default_factory=set)
     reasons: dict[str, Restriction] = field(default_factory=dict)
 
@@ -126,16 +127,35 @@ def compute_restrictions(
     slides: list[dict[str, Any]],
     accepted: set[str],
     uncertain: set[str],
+    unproven: dict[str, str] | None = None,
 ) -> RestrictionState:
-    """Bar accepted slides and slides in unconfirmed deliveries, plus their groups."""
-    state = RestrictionState(accepted=set(accepted), uncertain=set(uncertain))
-    direct = state.accepted | state.uncertain
+    """Bar accepted slides and slides in unconfirmed / unproven deliveries.
+
+    ``unproven`` maps slide ids to an explanation for legacy rows whose
+    receiving service can no longer be established. Such a slide is kept
+    barred even when the legacy row says "rejected": without proving which
+    receiver produced that terminal state, lifting the ban could let a
+    delivered (trained) slide into the blind test.
+    """
+    unproven = unproven or {}
+    state = RestrictionState(
+        accepted=set(accepted),
+        uncertain=set(uncertain),
+        unproven=set(unproven),
+    )
+    direct = state.accepted | state.uncertain | state.unproven
     for sid in sorted(direct):
         if sid in state.accepted:
             state.reasons[sid] = Restriction(
                 sid,
                 "accepted",
                 "该切片被终态接纳的交付覆盖，永久禁入测试",
+            )
+        elif sid in state.unproven:
+            state.reasons[sid] = Restriction(
+                sid,
+                "unproven",
+                unproven[sid],
             )
         else:
             state.reasons[sid] = Restriction(
@@ -274,6 +294,7 @@ def solve(
     uncertain: set[str],
     req_benign: int,
     req_malignant: int,
+    unproven: dict[str, str] | None = None,
 ) -> SolveResult:
     if req_benign < 0 or req_malignant < 0:
         raise Unsolvable("两类测试数量都不能为负数。")
@@ -282,7 +303,7 @@ def solve(
         raise Unsolvable("库中没有任何切片，无法划分。")
 
     groups = build_groups(slides)
-    restrictions = compute_restrictions(slides, accepted, uncertain)
+    restrictions = compute_restrictions(slides, accepted, uncertain, unproven)
     eligible = {s["slide_id"] for s in slides} - restrictions.barred
 
     total_b = sum(1 for s in slides if s["malignancy"] == "benign")
@@ -390,10 +411,12 @@ def _restriction_summary(state: RestrictionState) -> str:
     parts = []
     if state.accepted:
         parts.append(f"{len(state.accepted)} 张被终态接纳的交付永久禁入")
+    if state.unproven:
+        parts.append(f"{len(state.unproven)} 张所属旧交付无法证明接收方、继续禁入")
     if state.uncertain:
         parts.append(f"{len(state.uncertain)} 张所在交付状态未明、暂禁入")
-    if state.barred - state.accepted - state.uncertain:
-        parts.append(f"{len(state.barred - state.accepted - state.uncertain)} 张因连通组牵连被禁入")
+    if state.barred - state.accepted - state.uncertain - state.unproven:
+        parts.append(f"{len(state.barred - state.accepted - state.uncertain - state.unproven)} 张因连通组牵连被禁入")
     return "；".join(parts) if parts else "无"
 
 

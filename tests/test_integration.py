@@ -68,19 +68,30 @@ def wire(tmpdb, monkeypatch, fault="none", refuse=False):
         "/api/simulate",
         json={"fault": fault, "refuse": "1" if refuse else "0", "delay": "0.01"},
     )
+    identity = recv.get("/api/identity").json()["receiver_id"]
     real_send = receiver_client.send_delivery
     real_query = receiver_client.query_delivery
 
-    def send(receiver_url, delivery_id, checksum, slides, timeout=10.0):
+    def fetch_identity(receiver_url, timeout=10.0):
+        return identity
+
+    def send(
+        receiver_url,
+        delivery_id,
+        checksum,
+        slides,
+        timeout=10.0,
+        expected_receiver_id=None,
+    ):
         try:
-            resp = recv.post(
-                "/api/deliveries",
-                json={
-                    "delivery_id": delivery_id,
-                    "checksum": checksum,
-                    "slides": slides,
-                },
-            )
+            payload = {
+                "delivery_id": delivery_id,
+                "checksum": checksum,
+                "slides": slides,
+            }
+            if expected_receiver_id:
+                payload["expected_receiver_id"] = expected_receiver_id
+            resp = recv.post("/api/deliveries", json=payload)
         except Exception as exc:  # pragma: no cover
             return receiver_client.DeliveryOutcome(state="unknown", error=str(exc))
         if resp.status_code not in (200, 201):
@@ -91,7 +102,13 @@ def wire(tmpdb, monkeypatch, fault="none", refuse=False):
             )
         return receiver_client._normalise(resp.json(), checksum)
 
-    def query(receiver_url, delivery_id, expected_checksum=None, timeout=10.0):
+    def query(
+        receiver_url,
+        delivery_id,
+        expected_checksum=None,
+        timeout=10.0,
+        expected_receiver_id=None,
+    ):
         resp = recv.get(f"/api/deliveries/{delivery_id}")
         if resp.status_code == 404:
             return receiver_client.DeliveryOutcome(
@@ -101,12 +118,19 @@ def wire(tmpdb, monkeypatch, fault="none", refuse=False):
             return receiver_client.DeliveryOutcome(
                 state="unknown", error=f"HTTP {resp.status_code}", http_status=resp.status_code
             )
-        return receiver_client._normalise(resp.json(), expected_checksum or "")
+        data = resp.json()
+        if expected_receiver_id and data.get("receiver_id") != expected_receiver_id:
+            return receiver_client.DeliveryOutcome(
+                state="unknown", error="接收方身份不一致", http_status=200
+            )
+        return receiver_client._normalise(data, expected_checksum or "")
 
+    monkeypatch.setattr(receiver_client, "fetch_identity", fetch_identity)
     monkeypatch.setattr(receiver_client, "send_delivery", send)
     monkeypatch.setattr(receiver_client, "query_delivery", query)
     import app.service as svc
 
+    monkeypatch.setattr(svc.receiver_client, "fetch_identity", fetch_identity)
     monkeypatch.setattr(svc.receiver_client, "send_delivery", send)
     monkeypatch.setattr(svc.receiver_client, "query_delivery", query)
     return recv, real_send, real_query
@@ -457,7 +481,9 @@ def test_pending_delivery_suspends_other_plan_and_rejection_restores(conn, tmpdb
     m1 = storage.plan_membership(conn, plan1)
     test_slide = next(s for s, split in m1.items() if split == "test")
 
-    # hand-register a pending delivery covering the *test* slide of plan1
+    # hand-register a pending delivery covering the *test* slide of plan1.
+    # A real delivery is bound to the receiver that accepted it before it is
+    # written, so model that binding explicitly here.
     with storage.transaction(conn):
         storage.insert_delivery(
             conn,
@@ -466,6 +492,9 @@ def test_pending_delivery_suspends_other_plan_and_rejection_restores(conn, tmpdb
             split="train",
             checksum="c1",
             attempt=1,
+            receiver_id="RCV-TEST",
+            receiver_url="http://receiver",
+            binding="bound",
             rows=[
                 {
                     "slide_id": test_slide,

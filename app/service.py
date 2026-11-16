@@ -11,6 +11,18 @@ Transaction boundaries
 * ``start_delivery`` persists the pending record (and its frozen slide copy)
   *before* the first network call; a crash between the two leaves a verifiable
   pending delivery instead of a lost restriction.
+* The first successful contact binds the delivery to the receiving volume's
+  stable identity (``receiver_id``). From then on *only that receiver* may
+  confirm or continue the delivery: changing the configured address, or
+  mounting a fresh data volume behind the same address, produces a different
+  identity and is refused. The bound URL is used for verification, so an
+  unrelated receiver configured later can neither confirm old deliveries nor
+  receive them again. A normal restart of the original receiver keeps its
+  identity (stored in its data volume), so verify/retry still work.
+* Legacy deliveries with no provable receiver (``legacy_unproven``) are never
+  re-sent or verified against whatever address happens to be configured. An
+  accepted legacy record keeps its permanent ban; an unconfirmed or rejected
+  legacy record keeps its slides barred with an explicit reason.
 * Retries of an unconfirmed delivery reuse the same delivery id and checksum,
   so the receiver's idempotency prevents a second acceptance.
 * Restrictions are always derived from the delivery table; nothing is cached,
@@ -45,6 +57,10 @@ class ConcurrentRegistration(ServiceError):
     pass
 
 
+class ReceiverOwnershipError(ServiceError):
+    """The delivery may only be handled by its original receiving volume."""
+
+
 # ------------------------------------------------------------------ helpers
 
 
@@ -56,23 +72,52 @@ def _bump_delivery_generation(conn: sqlite3.Connection) -> None:
     storage.set_setting(conn, DELIVERY_GENERATION_KEY, str(_delivery_generation(conn) + 1))
 
 
-def restriction_sets(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
-    """(accepted, uncertain) slide ids, derived from every delivery row."""
+def _unproven_reason(delivery: dict[str, Any]) -> str:
+    return (
+        f"交付 {delivery['id']}（{delivery['status']}）无法证明原接收方，"
+        "按保守原则继续禁入测试；已接纳的记录不受影响。"
+    )
+
+
+def restriction_sets(
+    conn: sqlite3.Connection,
+) -> tuple[set[str], set[str], dict[str, str]]:
+    """(accepted, uncertain, unproven reasons) derived from every delivery row.
+
+    * accepted  -> permanent test ban, regardless of receiver binding (an
+                   acceptance that already happened can never be undone);
+    * pending   -> barred until confirmed (includes unbound first attempts);
+    * a terminal or pending legacy delivery that cannot prove its receiver is
+      reported as unproven and stays barred. In particular a "rejected" row
+      with no bound receiver must not lift a training exposure, because we
+      cannot show that the rejection came from the receiver holding the list.
+    """
     accepted: set[str] = set()
     uncertain: set[str] = set()
-    for d in conn.execute("SELECT id, status FROM deliveries"):
-        ids = storage.delivery_slide_ids(conn, d["id"])
-        if d["status"] == "accepted":
+    unproven: dict[str, str] = {}
+    for delivery in conn.execute(
+        "SELECT id, status, binding FROM deliveries"
+    ).fetchall():
+        ids = storage.delivery_slide_ids(conn, delivery["id"])
+        status = delivery["status"]
+        binding = delivery["binding"]
+        if status == "accepted":
             accepted |= ids
-        elif d["status"] == "pending":
+        elif binding == "legacy_unproven" or (
+            status == "rejected" and binding != "bound"
+        ):
+            for sid in ids:
+                unproven[sid] = _unproven_reason(dict(delivery))
+        elif status == "pending":
             uncertain |= ids
-    return accepted, uncertain
+        # rejected + bound: this delivery's restriction is lifted.
+    return accepted, uncertain, unproven
 
 
 def current_restrictions(conn: sqlite3.Connection) -> RestrictionState:
     slides = storage.all_slides(conn)
-    accepted, uncertain = restriction_sets(conn)
-    return allocator.compute_restrictions(slides, accepted, uncertain)
+    accepted, uncertain, unproven = restriction_sets(conn)
+    return allocator.compute_restrictions(slides, accepted, uncertain, unproven)
 
 
 def refresh_plans(conn: sqlite3.Connection) -> None:
@@ -83,8 +128,8 @@ def refresh_plans(conn: sqlite3.Connection) -> None:
     downloads, and are restored automatically once they pass again.
     """
     slides = storage.all_slides(conn)
-    accepted, uncertain = restriction_sets(conn)
-    restrictions = allocator.compute_restrictions(slides, accepted, uncertain)
+    accepted, uncertain, unproven = restriction_sets(conn)
+    restrictions = allocator.compute_restrictions(slides, accepted, uncertain, unproven)
     for plan in storage.list_plans(conn):
         membership = storage.plan_membership(conn, int(plan["id"]))
         frozen = storage.plan_slides(conn, int(plan["id"]))
@@ -137,12 +182,14 @@ def publish_plan(
 ) -> dict[str, Any]:
     with storage.read_snapshot(conn):
         slides = storage.all_slides(conn)
-        accepted, uncertain = restriction_sets(conn)
+        accepted, uncertain, unproven = restriction_sets(conn)
         generation = _delivery_generation(conn)
         snapshot_fingerprint = allocator.fingerprint(slides)
 
     try:
-        result = allocator.solve(slides, accepted, uncertain, req_benign, req_malignant)
+        result = allocator.solve(
+            slides, accepted, uncertain, req_benign, req_malignant, unproven
+        )
     except Unsolvable as exc:
         with storage.transaction(conn):
             storage.log_event(conn, "plan_unsolvable", f"无法划分：{exc.reason}")
@@ -277,11 +324,118 @@ def _latest_attempt(conn: sqlite3.Connection, plan_id: int, checksum: str) -> di
     return dict(row) if row else None
 
 
+def _require_original_receiver(
+    delivery: dict[str, Any], receiver_url: str | None
+) -> tuple[str, str | None]:
+    """Resolve where a verify/retry may go, refusing substitute receivers.
+
+    Returns ``(url, expected_receiver_id)``. Raises ``ReceiverOwnershipError``
+    for a legacy row that cannot prove its receiver at all.
+
+    The URL recorded when the delivery was registered is authoritative: a
+    later change of the configured address never redirects an old delivery to
+    the new address. ``receiver_url`` (the current setting) is only a fallback
+    for rows that somehow lost their recorded URL, never a replacement.
+    """
+    binding = delivery.get("binding")
+    if binding == "legacy_unproven" or binding not in {"bound", "unbound"}:
+        raise ReceiverOwnershipError(
+            f"交付 {delivery['id']} 来自旧库，无法证明原接收方，系统不会向任何地址"
+            "重发或核实；相关切片按保守原则继续禁入测试。"
+        )
+    recorded = (delivery.get("receiver_url") or "").strip()
+    if binding == "bound":
+        bound_id = (delivery.get("receiver_id") or "").strip()
+        if not recorded or not bound_id:
+            raise ReceiverOwnershipError(
+                f"交付 {delivery['id']} 的接收方绑定信息不完整，无法安全核实或重试。"
+            )
+        return recorded, bound_id
+    # unbound: registered at `recorded`; that is the only receiver it may
+    # ever be continued at. The first confirmed identity binds it.
+    if not recorded:
+        if not receiver_url:
+            raise ReceiverOwnershipError(
+                f"未配置接收服务地址，无法处理交付 {delivery['id']}。"
+            )
+        return receiver_url, None
+    return recorded, None
+
+
+def _identity_outcome(error: str) -> receiver_client.DeliveryOutcome:
+    return receiver_client.DeliveryOutcome(state="unknown", error=error)
+
+
+def _preflight(
+    delivery: dict[str, Any],
+    receiver_url: str,
+    timeout: float,
+    *,
+    write: bool,
+) -> tuple[str, str | None, str | None, receiver_client.DeliveryOutcome | None]:
+    """Decide the only receiver allowed to handle this delivery.
+
+    Returns ``(url, expected_receiver_id, observed_receiver_id, refusal)``.
+    A non-None ``refusal`` is a ready-made unknown outcome and means no network
+    request may be made.
+
+    A *readable* identity that differs from the bound one is always refused:
+    that is the "address changed / data volume replaced" case. An unreadable
+    identity never blocks an *initial* send (the receiver is simply down; the
+    pending row and its restrictions already exist), but it does block a write
+    for a delivery that already has a recorded owner, and it blocks an
+    unbound delivery from ever being bound blindly — otherwise a later
+    replacement volume could be mistaken for the original one.
+    """
+    url, expected = _require_original_receiver(delivery, receiver_url)
+    observed = receiver_client.fetch_identity(url, timeout=timeout)
+    if expected is not None:
+        if observed is not None and observed != expected:
+            return (
+                url,
+                expected,
+                observed,
+                _identity_outcome(
+                    "当前地址上的接收服务身份与交付绑定的原接收方不一致"
+                    "（地址已改或数据卷已更换），未向替代方重发或核实。"
+                ),
+            )
+        if write and observed is None:
+            return (
+                url,
+                expected,
+                None,
+                _identity_outcome(
+                    "无法读取原接收方身份，未发送；相关切片继续保持禁入，稍后可重试。"
+                ),
+            )
+        return url, expected, observed, None
+    if write and observed is None:
+        return (
+            url,
+            None,
+            None,
+            _identity_outcome(
+                "无法读取接收服务身份，未发送；相关切片继续保持禁入，待接收方恢复后重试。"
+            ),
+        )
+    return url, None, observed, None
+
+
 def start_delivery(
     conn: sqlite3.Connection, plan_id: int, receiver_url: str, timeout: float = 10.0
 ) -> dict[str, Any]:
-    """Register a pending verification record, then POST the frozen train list."""
+    """Register a pending verification record, then POST the frozen train list.
+
+    The intended receiver's identity is read before the pending row is written,
+    so the delivery is bound to its original receiver from birth. A response
+    lost after the receiver stored the list can therefore never be "retried"
+    against a substitute receiver configured later.
+    """
     rows, checksum = _train_content(conn, plan_id)
+    # Read-only identity probe; the durable pending row is still written
+    # before any POST.
+    intended_receiver = receiver_client.fetch_identity(receiver_url, timeout=timeout)
 
     with storage.transaction(conn):
         refresh_plans(conn)
@@ -316,6 +470,9 @@ def start_delivery(
                 checksum=checksum,
                 attempt=attempt,
                 rows=rows,
+                receiver_id=intended_receiver,
+                receiver_url=receiver_url,
+                binding="bound" if intended_receiver else "unbound",
             )
         except sqlite3.IntegrityError:
             # A concurrent request registered the same attempt first. That
@@ -327,15 +484,37 @@ def start_delivery(
         storage.log_event(
             conn,
             "delivery_pending",
-            f"名单 #{plan_id} 训练名单（{len(rows)} 张）登记为待核实交付 {delivery_id}，"
-            f"发送前状态已落库。",
+            f"名单 #{plan_id} 训练名单（{len(rows)} 张）登记为待核实交付 {delivery_id}"
+            + (
+                f"，原接收方 {intended_receiver}，发送前状态已落库。"
+                if intended_receiver
+                else "；尚未能读取接收方身份，发送前状态已落库。"
+            ),
         )
         refresh_plans(conn)
+        delivery = storage.get_delivery(conn, delivery_id)
 
-    outcome = receiver_client.send_delivery(
-        receiver_url, delivery_id, checksum, rows, timeout=timeout
+    url, expected, observed, refusal = _preflight(
+        delivery, receiver_url, timeout, write=True
     )
-    return _apply_outcome(conn, delivery_id, outcome, origin="send")
+    if refusal is not None:
+        return _apply_outcome(conn, delivery_id, refusal, origin="send")
+    outcome = receiver_client.send_delivery(
+        url,
+        delivery_id,
+        checksum,
+        rows,
+        timeout=timeout,
+        expected_receiver_id=expected or observed,
+    )
+    return _apply_outcome(
+        conn,
+        delivery_id,
+        outcome,
+        origin="send",
+        receiver_id=expected or observed or outcome.receiver_id,
+        receiver_url=url,
+    )
 
 
 def verify_delivery(
@@ -351,10 +530,26 @@ def verify_delivery(
             "reused": True,
             "message": f"该交付已是终态 {delivery['status']}，不会因核实而改变。",
         }
-    outcome = receiver_client.query_delivery(
-        receiver_url, delivery_id, delivery["checksum"], timeout=timeout
+    url, expected, observed, refusal = _preflight(
+        delivery, receiver_url, timeout, write=False
     )
-    return _apply_outcome(conn, delivery_id, outcome, origin="verify")
+    if refusal is not None:
+        return _apply_outcome(conn, delivery_id, refusal, origin="verify")
+    outcome = receiver_client.query_delivery(
+        url,
+        delivery_id,
+        delivery["checksum"],
+        timeout=timeout,
+        expected_receiver_id=expected or observed,
+    )
+    return _apply_outcome(
+        conn,
+        delivery_id,
+        outcome,
+        origin="verify",
+        receiver_id=expected or observed or outcome.receiver_id,
+        receiver_url=url,
+    )
 
 
 def retry_delivery(
@@ -376,10 +571,29 @@ def retry_delivery(
     ]
     if not rows:
         raise ServiceError("交付的冻结内容缺失，无法重试。")
-    outcome = receiver_client.send_delivery(
-        receiver_url, delivery_id, delivery["checksum"], rows, timeout=timeout
+    # A retry is a write: never let it reach a receiver that is not provably
+    # the original one. If identity cannot be proven, keep the restriction.
+    url, expected, observed, refusal = _preflight(
+        delivery, receiver_url, timeout, write=True
     )
-    return _apply_outcome(conn, delivery_id, outcome, origin="retry")
+    if refusal is not None:
+        return _apply_outcome(conn, delivery_id, refusal, origin="retry")
+    outcome = receiver_client.send_delivery(
+        url,
+        delivery_id,
+        delivery["checksum"],
+        rows,
+        timeout=timeout,
+        expected_receiver_id=expected or observed,
+    )
+    return _apply_outcome(
+        conn,
+        delivery_id,
+        outcome,
+        origin="retry",
+        receiver_id=expected or observed or outcome.receiver_id,
+        receiver_url=url,
+    )
 
 
 def _apply_outcome(
@@ -387,16 +601,62 @@ def _apply_outcome(
     delivery_id: str,
     outcome: receiver_client.DeliveryOutcome,
     origin: str,
+    receiver_id: str | None = None,
+    receiver_url: str | None = None,
 ) -> dict[str, Any]:
     with storage.transaction(conn):
         delivery = storage.get_delivery(conn, delivery_id)
         if not delivery:
             raise ServiceError(f"交付 {delivery_id} 不存在。")
+        # Bind (once) to the receiver that actually handled this delivery. A
+        # bound delivery never migrates to another identity.
+        if delivery["binding"] == "unbound" and receiver_id:
+            bound = storage.bind_delivery(
+                conn, delivery_id, receiver_id, receiver_url or ""
+            )
+            if not bound:
+                storage.log_event(
+                    conn,
+                    "delivery_ownership_conflict",
+                    f"交付 {delivery_id} 的接收方绑定被并发请求改动，本次结果按未明处理。",
+                )
+                outcome = receiver_client.DeliveryOutcome(
+                    state="unknown",
+                    error="接收方绑定发生并发变化，本次结果未采用。",
+                    payload=outcome.payload,
+                    receiver_id=receiver_id,
+                )
+            else:
+                delivery = storage.get_delivery(conn, delivery_id) or delivery
+                storage.log_event(
+                    conn,
+                    "delivery_bound",
+                    f"交付 {delivery_id} 绑定原接收方 {receiver_id}"
+                    + (f"（{receiver_url}）" if receiver_url else "") + "。",
+                )
+        elif delivery["binding"] == "bound" and receiver_id:
+            if receiver_id != delivery["receiver_id"]:
+                # Never let a substitute receiver confirm or re-register.
+                outcome = receiver_client.DeliveryOutcome(
+                    state="unknown",
+                    error=(
+                        f"接收服务身份 {receiver_id} 与交付绑定的原接收方 "
+                        f"{delivery['receiver_id']} 不一致，视为未明交付。"
+                    ),
+                    payload=outcome.payload,
+                    receiver_id=receiver_id,
+                )
+        elif delivery["binding"] == "legacy_unproven":
+            # A legacy row is never networked; if one somehow reaches here,
+            # treat any answer as unconfirmed rather than rewriting history.
+            outcome = _identity_outcome(
+                f"交付 {delivery_id} 为无法证明接收方的旧记录，本次结果不予采用。"
+            )
         if outcome.state in {"accepted", "rejected"} and delivery["status"] == "pending":
             payload = json.dumps(
                 outcome.payload or {}, ensure_ascii=False, sort_keys=True
             )
-            storage.set_delivery_terminal(
+            written = storage.set_delivery_terminal(
                 conn,
                 delivery_id,
                 status=outcome.state,
@@ -404,6 +664,24 @@ def _apply_outcome(
                 receipt_ref=outcome.receipt_ref,
                 receipt_json=payload,
             )
+            if not written:
+                # A concurrent worker (another retry / late receipt / startup
+                # reconcile) wrote the terminal state first. Keep it.
+                storage.log_event(
+                    conn,
+                    "delivery_conflict",
+                    f"交付 {delivery_id} 已被并发写入终态，忽略本次 {outcome.state}（{origin}）。",
+                )
+                message = (
+                    f"交付 {delivery_id} 已有并发写入的终态，以先写入者为准，未覆盖。"
+                )
+                refreshed = storage.get_delivery(conn, delivery_id)
+                return {
+                    "delivery": refreshed,
+                    "outcome": outcome,
+                    "reused": False,
+                    "message": message,
+                }
             storage.store_receipt(conn, str(outcome.receipt_ref), delivery_id, payload)
             _bump_delivery_generation(conn)
             storage.log_event(
@@ -471,13 +749,21 @@ def startup_reconcile(
 def reconcile_pending(
     conn: sqlite3.Connection, receiver_url: str, timeout: float = 2.0
 ) -> list[dict[str, Any]]:
-    """Only re-query pending deliveries; never drops a restriction."""
+    """Only re-query pending deliveries; never drops a restriction.
+
+    Each bound delivery is checked against its *original* receiver (the URL
+    stored at binding time), not against whatever address is configured now.
+    An offline original receiver therefore leaves its delivery pending/unknown
+    without affecting other deliveries, and never migrates it to a substitute.
+    """
     results = []
     for d in storage.list_deliveries(conn):
         if d["status"] != "pending":
             continue
         try:
             results.append(verify_delivery(conn, d["id"], receiver_url, timeout=timeout))
+        except ReceiverOwnershipError as exc:
+            results.append({"delivery": d, "error": str(exc)})
         except Exception as exc:  # recovery must never abort startup
             results.append({"delivery": d, "error": f"{type(exc).__name__}: {exc}"})
     return results
