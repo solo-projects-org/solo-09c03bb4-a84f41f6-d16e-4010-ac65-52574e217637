@@ -11,6 +11,11 @@ Guarantees
 * terminal state (accepted / rejected) is written once and never changed,
   including by retries or by an operator API;
 * every delivery is queryable by id with its frozen slide list;
+* the service has a persistent instance identity (``receiver_id``), generated
+  on first start and stored in its database: it survives restarts but changes
+  when the data volume is replaced, so the sender can tell the original
+  receiver apart from a substitute. It is exposed at ``GET /api/identity``
+  and embedded in every delivery response;
 * simulation endpoints can force refusal and inject faults (HTTP 500 / 404,
   delays / timeouts) so the sender's "unknown" path can be exercised.
 """
@@ -94,7 +99,16 @@ def connect() -> sqlite3.Connection:
     conn.execute(
         "INSERT OR IGNORE INTO controls(key, value) VALUES ('refuse', '0')"
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO controls(key, value) VALUES ('receiver_id', ?)",
+        ("RCV-" + secrets.token_hex(8).upper(),),
+    )
     return conn
+
+
+def receiver_id() -> str:
+    """Persistent instance identity of this receiver (and its data volume)."""
+    return controls().get("receiver_id", "")
 
 
 def controls() -> dict[str, str]:
@@ -150,6 +164,16 @@ def healthz():
     return {"ok": True}
 
 
+@app.get("/api/identity")
+def identity():
+    """Persistent instance identity; lets the sender pin deliveries to us."""
+    return {
+        "service": "pathology-receiver",
+        "receiver_id": receiver_id(),
+        "time": now(),
+    }
+
+
 def _public(row: sqlite3.Row | dict, include_slides: bool = True) -> dict:
     data = dict(row)
     out = {
@@ -160,6 +184,7 @@ def _public(row: sqlite3.Row | dict, include_slides: bool = True) -> dict:
         "comment": data["comment"],
         "created_at": data["created_at"],
         "slide_count": data["slide_count"],
+        "receiver_id": receiver_id(),
     }
     if include_slides:
         out["slides"] = json.loads(data["slides_json"])
@@ -290,6 +315,7 @@ async def post_delivery(request: Request):
             "receipt_ref": receipt_ref,
             "comment": comment,
             "created_at": now(),
+            "receiver_id": receiver_id(),
         },
         status_code=201,
     )
@@ -391,6 +417,7 @@ ul{{font-size:12px;color:#3a4353}}
 </style></head><body>
 <h1>独立接收服务</h1>
 <p>终态接纳 / 拒收一经写入不可更改；同一交付号重复提交仅返回原回执，不重复接纳。</p>
+<p>本接收服务身份：<code>{cfg.get('receiver_id')}</code>（随数据卷持久保存；更换数据卷即更换身份）。</p>
 <p>当前控制项：故障注入 <b>{cfg.get('fault')}</b>，延迟 {cfg.get('delay')}s，
 拒收模式 <b>{'开' if cfg.get('refuse') == '1' else '关'}</b>。</p>
 <form method="post" action="/simulate-form">

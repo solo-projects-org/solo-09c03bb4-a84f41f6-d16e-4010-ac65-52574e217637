@@ -12,12 +12,14 @@ services:
       - app-data:/data
     depends_on:
       - receiver
+      - receiver-b
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+  # 接收服务 A：独立进程、独立数据卷、独立实例身份
   receiver:
     build: .
     command: uvicorn receiver.main:app --host 0.0.0.0 --port 8000
@@ -35,6 +37,27 @@ services:
       timeout: 5s
       retries: 5
 
+  # 接收服务 B：第二个独立接收方，用于演示“切地址 / 换接收方”场景。
+  # 在网页“交付与接收服务”里把地址改为 http://receiver-b:8000 即可切换；
+  # 已登记的旧交付仍只归属原接收方，不会向替代方重发。
+  receiver-b:
+    build: .
+    command: uvicorn receiver.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8002:8000"
+    environment:
+      RECEIVER_DB_PATH: /data/receiver.sqlite3
+      RECEIVER_DECISION: accept
+      RECEIVER_FAULT: none
+    volumes:
+      - receiver-b-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   app-data:
   receiver-data:
+  receiver-b-data:

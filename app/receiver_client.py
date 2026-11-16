@@ -11,6 +11,15 @@ The receiver stores the delivery id once. Repeating the same POST returns the
 same receipt (idempotent), so a retry after a timeout or a crash never creates
 a second acceptance.
 
+Attribution
+-----------
+The receiver exposes a persistent instance identity at
+``GET {receiver_url}/api/identity`` (survives restarts, changes when the
+receiver's data volume is replaced). The sender records that identity on each
+delivery *before* any content is sent, and later only ever confirms or
+re-sends that delivery with the receiver proving the same identity — never
+with a substitute at a changed address or a swapped data volume.
+
 Every network failure, non-2xx response, malformed body and timeout is mapped
 to ``"unknown"``. Unknown is *not* rejection: the slide stays barred from test.
 """
@@ -27,6 +36,42 @@ class DeliveryOutcome:
     payload: dict[str, Any] | None = None
     error: str | None = None
     http_status: int | None = None
+    receiver_id: str | None = None
+
+
+@dataclass
+class IdentityOutcome:
+    receiver_id: str | None = None
+    error: str | None = None
+    http_status: int | None = None
+
+
+def fetch_identity(receiver_url: str, timeout: float = 10.0) -> IdentityOutcome:
+    """GET the receiver's persistent instance identity. Never raises."""
+    import httpx
+
+    url = receiver_url.rstrip("/") + "/api/identity"
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(url)
+    except Exception as exc:  # httpx errors, DNS, connection reset, timeout ...
+        return IdentityOutcome(error=f"{type(exc).__name__}: {exc}")
+    if resp.status_code != 200:
+        return IdentityOutcome(
+            error=f"身份接口返回 HTTP {resp.status_code}", http_status=resp.status_code
+        )
+    try:
+        data = resp.json()
+    except Exception:
+        return IdentityOutcome(error="身份接口响应不是合法 JSON", http_status=resp.status_code)
+    if not isinstance(data, dict):
+        return IdentityOutcome(error="身份接口响应结构异常", http_status=resp.status_code)
+    receiver_id = str(data.get("receiver_id") or "").strip()
+    if not receiver_id:
+        return IdentityOutcome(
+            error="接收服务未提供身份标识（可能为旧版本）", http_status=resp.status_code
+        )
+    return IdentityOutcome(receiver_id=receiver_id, http_status=resp.status_code)
 
 
 def _normalise(data: dict[str, Any], expected_checksum: str) -> DeliveryOutcome:
@@ -50,7 +95,13 @@ def _normalise(data: dict[str, Any], expected_checksum: str) -> DeliveryOutcome:
             error="接收服务回执校验和与发送内容不一致，视为未明交付。",
             payload=data,
         )
-    return DeliveryOutcome(state=status, receipt_ref=str(receipt), payload=data)
+    receiver_id = data.get("receiver_id")
+    return DeliveryOutcome(
+        state=status,
+        receipt_ref=str(receipt),
+        payload=data,
+        receiver_id=str(receiver_id) if receiver_id else None,
+    )
 
 
 def send_delivery(

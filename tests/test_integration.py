@@ -103,12 +103,22 @@ def wire(tmpdb, monkeypatch, fault="none", refuse=False):
             )
         return receiver_client._normalise(resp.json(), expected_checksum or "")
 
+    def ident(receiver_url, timeout=10.0):
+        resp = recv.get("/api/identity")
+        if resp.status_code != 200:
+            return receiver_client.IdentityOutcome(error=f"HTTP {resp.status_code}")
+        return receiver_client.IdentityOutcome(
+            receiver_id=resp.json().get("receiver_id")
+        )
+
     monkeypatch.setattr(receiver_client, "send_delivery", send)
     monkeypatch.setattr(receiver_client, "query_delivery", query)
+    monkeypatch.setattr(receiver_client, "fetch_identity", ident)
     import app.service as svc
 
     monkeypatch.setattr(svc.receiver_client, "send_delivery", send)
     monkeypatch.setattr(svc.receiver_client, "query_delivery", query)
+    monkeypatch.setattr(svc.receiver_client, "fetch_identity", ident)
     return recv, real_send, real_query
 
 
@@ -457,7 +467,8 @@ def test_pending_delivery_suspends_other_plan_and_rejection_restores(conn, tmpdb
     m1 = storage.plan_membership(conn, plan1)
     test_slide = next(s for s, split in m1.items() if split == "test")
 
-    # hand-register a pending delivery covering the *test* slide of plan1
+    # hand-register a pending delivery covering the *test* slide of plan1,
+    # attributed to a receiver (as every post-attribution delivery is)
     with storage.transaction(conn):
         storage.insert_delivery(
             conn,
@@ -466,6 +477,8 @@ def test_pending_delivery_suspends_other_plan_and_rejection_restores(conn, tmpdb
             split="train",
             checksum="c1",
             attempt=1,
+            receiver_url="http://receiver",
+            receiver_id="RCV-TEST",
             rows=[
                 {
                     "slide_id": test_slide,

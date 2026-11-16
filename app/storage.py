@@ -7,7 +7,10 @@ Design rules enforced here:
   * a delivery row (with its own frozen copy of the slide rows) exists *before*
     any network call, so a crash can never lose a restriction or double-send;
   * deliveries are append-only facts; a delivery id maps to exactly one frozen
-    content checksum and exactly one terminal state.
+    content checksum and exactly one terminal state;
+  * every delivery records its *owning receiver* (the URL used at send time and
+    the receiver's persistent instance id, captured before any content leaves);
+    legacy rows without attribution keep their ban and are never re-sent.
 """
 from __future__ import annotations
 
@@ -78,6 +81,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
     attempt INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
     receiver_status TEXT NOT NULL DEFAULT 'unknown',
+    receiver_url TEXT,
+    receiver_id TEXT,
     receipt_ref TEXT,
     receipt_json TEXT,
     created_at TEXT NOT NULL,
@@ -117,6 +122,21 @@ class CapacityError(Exception):
     pass
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additively upgrade older database files.
+
+    Delivery-attribution columns were introduced after the first deployment;
+    rows created before them keep NULL receiver_url / receiver_id and are
+    treated as *unattributed* (their ban is kept, never lifted by a
+    substitute receiver).
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(deliveries)")}
+    if "receiver_url" not in cols:
+        conn.execute("ALTER TABLE deliveries ADD COLUMN receiver_url TEXT")
+    if "receiver_id" not in cols:
+        conn.execute("ALTER TABLE deliveries ADD COLUMN receiver_id TEXT")
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -139,6 +159,7 @@ def init_db(path: str) -> None:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = FULL")
             conn.executescript(SCHEMA)
+            _migrate(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES ('receiver_url', ?)",
                 (os.environ.get("RECEIVER_URL", "http://receiver:8000"),),
@@ -373,12 +394,25 @@ def insert_delivery(
     checksum: str,
     attempt: int,
     rows: list[dict[str, Any]],
+    receiver_url: str | None = None,
+    receiver_id: str | None = None,
     created_at: str | None = None,
 ) -> None:
     conn.execute(
         "INSERT INTO deliveries(id, plan_id, split, checksum, slide_count, attempt, "
-        "status, receiver_status, created_at) VALUES (?,?,?,?,?,?,'pending','unknown',?)",
-        (delivery_id, plan_id, split, checksum, len(rows), attempt, created_at or now()),
+        "status, receiver_status, receiver_url, receiver_id, created_at) "
+        "VALUES (?,?,?,?,?,?,'pending','unknown',?,?,?)",
+        (
+            delivery_id,
+            plan_id,
+            split,
+            checksum,
+            len(rows),
+            attempt,
+            receiver_url,
+            receiver_id,
+            created_at or now(),
+        ),
     )
     conn.executemany(
         "INSERT INTO delivery_slides(delivery_id, slide_id, patient_id, repeat_group, malignancy) "
@@ -442,6 +476,26 @@ def delivery_slide_ids(conn: sqlite3.Connection, delivery_id: str) -> set[str]:
             "SELECT slide_id FROM delivery_slides WHERE delivery_id=?", (delivery_id,)
         )
     }
+
+
+def set_delivery_receiver_id(
+    conn: sqlite3.Connection, delivery_id: str, receiver_id: str
+) -> None:
+    """Bind the receiver instance id once; never overwrite an existing one."""
+    conn.execute(
+        "UPDATE deliveries SET receiver_id=? WHERE id=? AND receiver_id IS NULL",
+        (receiver_id, delivery_id),
+    )
+
+
+def set_delivery_receiver_url(
+    conn: sqlite3.Connection, delivery_id: str, receiver_url: str
+) -> None:
+    """Record a verified address migration of the *same* receiver identity."""
+    conn.execute(
+        "UPDATE deliveries SET receiver_url=? WHERE id=?",
+        (receiver_url, delivery_id),
+    )
 
 
 def set_delivery_terminal(

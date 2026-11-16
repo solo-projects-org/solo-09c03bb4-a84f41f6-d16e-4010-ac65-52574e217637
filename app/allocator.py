@@ -14,9 +14,11 @@ Deliveries carry a *training* list to the independent receiver.
 * accepted delivery  -> its slides are permanently barred from the test split;
 * pending / unknown  -> its slides are temporarily barred (state not confirmed,
                         receiver record missing, or the check timed out);
-* rejected delivery  -> only that delivery's restriction is lifted; the slide
-                        can become test-eligible again if no other delivery
-                        bars it.
+* rejected delivery  -> only that delivery's restriction is lifted, and only
+                        when the rejection is *attributed* (proven to come from
+                        the delivery's owning receiver); an unattributed
+                        rejection keeps the ban with an explicit reason;
+  the slide can become test-eligible again only if no other delivery bars it.
 
 A barred slide drags its whole *current* connected group with it, because a
 group can never be split. The restrictions are always derived from the current
@@ -126,8 +128,13 @@ def compute_restrictions(
     slides: list[dict[str, Any]],
     accepted: set[str],
     uncertain: set[str],
+    uncertain_reasons: dict[str, str] | None = None,
 ) -> RestrictionState:
-    """Bar accepted slides and slides in unconfirmed deliveries, plus their groups."""
+    """Bar accepted slides and slides in unconfirmed deliveries, plus their groups.
+
+    ``uncertain_reasons`` may override the per-slide explanation for specific
+    uncertain slides (e.g. legacy deliveries whose receiver cannot be proven).
+    """
     state = RestrictionState(accepted=set(accepted), uncertain=set(uncertain))
     direct = state.accepted | state.uncertain
     for sid in sorted(direct):
@@ -138,11 +145,10 @@ def compute_restrictions(
                 "该切片被终态接纳的交付覆盖，永久禁入测试",
             )
         else:
-            state.reasons[sid] = Restriction(
-                sid,
-                "uncertain",
-                "该切片所在交付尚未确认（待核实/查无记录/超时），暂禁入测试",
+            detail = (uncertain_reasons or {}).get(sid) or (
+                "该切片所在交付尚未确认（待核实/查无记录/超时），暂禁入测试"
             )
+            state.reasons[sid] = Restriction(sid, "uncertain", detail)
     state.barred = set(direct)
     groups = build_groups(slides)
     for group in groups:
@@ -274,6 +280,7 @@ def solve(
     uncertain: set[str],
     req_benign: int,
     req_malignant: int,
+    uncertain_reasons: dict[str, str] | None = None,
 ) -> SolveResult:
     if req_benign < 0 or req_malignant < 0:
         raise Unsolvable("两类测试数量都不能为负数。")
@@ -282,7 +289,7 @@ def solve(
         raise Unsolvable("库中没有任何切片，无法划分。")
 
     groups = build_groups(slides)
-    restrictions = compute_restrictions(slides, accepted, uncertain)
+    restrictions = compute_restrictions(slides, accepted, uncertain, uncertain_reasons)
     eligible = {s["slide_id"] for s in slides} - restrictions.barred
 
     total_b = sum(1 for s in slides if s["malignancy"] == "benign")

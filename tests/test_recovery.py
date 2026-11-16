@@ -72,10 +72,18 @@ def _wire(monkeypatch, fault="none", refuse=False):
             )
         return receiver_client._normalise(resp.json(), expected_checksum or "")
 
+    def ident(receiver_url, timeout=10.0):
+        resp = recv.get("/api/identity")
+        if resp.status_code != 200:
+            return receiver_client.IdentityOutcome(error=f"HTTP {resp.status_code}")
+        return receiver_client.IdentityOutcome(receiver_id=resp.json().get("receiver_id"))
+
     monkeypatch.setattr(receiver_client, "send_delivery", send)
     monkeypatch.setattr(receiver_client, "query_delivery", query)
+    monkeypatch.setattr(receiver_client, "fetch_identity", ident)
     monkeypatch.setattr(service.receiver_client, "send_delivery", send)
     monkeypatch.setattr(service.receiver_client, "query_delivery", query)
+    monkeypatch.setattr(service.receiver_client, "fetch_identity", ident)
     return recv
 
 
@@ -88,20 +96,23 @@ def _seed(app_db):
 
 
 def test_crash_before_post_leaves_verifiable_pending(env, monkeypatch):
-    """The process dies after the pending row but before the POST."""
+    """The process dies after the pending row but before any network contact."""
     app_db, _ = env
     conn, plan_id = _seed(app_db)
 
     def boom(*args, **kwargs):
-        raise KeyboardInterrupt("simulated crash during POST")
+        raise KeyboardInterrupt("simulated crash during the identity handshake")
 
-    monkeypatch.setattr(service.receiver_client, "send_delivery", boom)
+    monkeypatch.setattr(service.receiver_client, "fetch_identity", boom)
     with pytest.raises(KeyboardInterrupt):
         service.start_delivery(conn, plan_id, "http://receiver")
 
     pending = [d for d in storage.list_deliveries(conn) if d["status"] == "pending"]
     assert len(pending) == 1
     pid = pending[0]["id"]
+    # the URL was recorded at registration; no identity/content was exchanged
+    assert pending[0]["receiver_url"] == "http://receiver"
+    assert pending[0]["receiver_id"] is None
     # restriction survived: slides of that delivery are barred from test
     state = service.current_restrictions(conn)
     assert set(storage.delivery_slide_ids(conn, pid)) <= state.uncertain
@@ -113,9 +124,10 @@ def test_crash_before_post_leaves_verifiable_pending(env, monkeypatch):
     results = service.reconcile_pending(conn2, "http://receiver")
     assert results and results[0]["delivery"]["status"] == "pending"  # 404 => unknown
     assert recv.get(f"/api/deliveries/{pid}").status_code == 404
-    # then an explicit retry delivers idempotently
+    # then an explicit retry establishes identity and delivers idempotently
     res = service.retry_delivery(conn2, pid, "http://receiver")
     assert res["delivery"]["status"] == "accepted"
+    assert res["delivery"]["receiver_id"] == recv.get("/api/identity").json()["receiver_id"]
     assert len(recv.get("/api/deliveries").json()) == 1
     conn2.close()
 
@@ -124,6 +136,12 @@ def test_crash_after_receiver_store_before_local_commit(env, monkeypatch):
     """Receiver stored and returned; the sender dies before recording it."""
     app_db, _ = env
     conn, plan_id = _seed(app_db)
+
+    # the identity handshake succeeds against the real receiver first
+    rid = TestClient(receiver_app).get("/api/identity").json()["receiver_id"]
+
+    def ident_ok(*args, **kwargs):
+        return receiver_client.IdentityOutcome(receiver_id=rid)
 
     def crash_after_send(receiver_url, delivery_id, checksum, slides, timeout=10.0):
         # perform the real POST through the receiver ASGI app, then "crash"
@@ -134,12 +152,14 @@ def test_crash_after_receiver_store_before_local_commit(env, monkeypatch):
         )
         raise KeyboardInterrupt("simulated crash after receiver stored the delivery")
 
+    monkeypatch.setattr(service.receiver_client, "fetch_identity", ident_ok)
     monkeypatch.setattr(service.receiver_client, "send_delivery", crash_after_send)
     with pytest.raises(KeyboardInterrupt):
         service.start_delivery(conn, plan_id, "http://receiver")
     pending = [d for d in storage.list_deliveries(conn) if d["status"] == "pending"]
     assert len(pending) == 1
     pid = pending[0]["id"]
+    assert pending[0]["receiver_id"] == rid
     conn.close()
 
     recv = TestClient(receiver_app)
@@ -154,7 +174,9 @@ def test_crash_after_receiver_store_before_local_commit(env, monkeypatch):
         return receiver_client._normalise(resp.json(), expected_checksum or "")
 
     monkeypatch.setattr(receiver_client, "query_delivery", query)
+    monkeypatch.setattr(receiver_client, "fetch_identity", ident_ok)
     monkeypatch.setattr(service.receiver_client, "query_delivery", query)
+    monkeypatch.setattr(service.receiver_client, "fetch_identity", ident_ok)
 
     conn2 = storage.connect(app_db)
     results = service.reconcile_pending(conn2, "http://receiver")
@@ -173,13 +195,18 @@ def test_restart_with_receiver_down_keeps_restrictions(env, monkeypatch):
     app_db, _ = env
     conn, plan_id = _seed(app_db)
 
+    def down_ident(*args, **kwargs):
+        return receiver_client.IdentityOutcome(error="连接被拒")
+
     def down(*args, **kwargs):
         return receiver_client.DeliveryOutcome(state="unknown", error="连接被拒")
 
+    monkeypatch.setattr(service.receiver_client, "fetch_identity", down_ident)
     monkeypatch.setattr(service.receiver_client, "send_delivery", down)
     res = service.start_delivery(conn, plan_id, "http://receiver")
     pid = res["delivery"]["id"]
     assert res["delivery"]["status"] == "pending"
+    assert "未发送" in (res["delivery"]["last_error"] or "") or res["delivery"]["receiver_status"] == "unknown"
     conn.close()
 
     # restart with the receiver still unreachable

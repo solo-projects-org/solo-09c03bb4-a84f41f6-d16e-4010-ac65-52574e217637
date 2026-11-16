@@ -11,22 +11,40 @@ Transaction boundaries
 * ``start_delivery`` persists the pending record (and its frozen slide copy)
   *before* the first network call; a crash between the two leaves a verifiable
   pending delivery instead of a lost restriction.
+* Delivery attribution (交付归属): every delivery is bound to the *identity*
+  of the receiver that first accepted contact. The sender records the
+  receiver URL on the pending row and fetches the receiver's persistent
+  instance id *before* any content leaves. Verify/retry of an old delivery is
+  only ever directed at the owning receiver — a changed address or a swapped
+  receiver data volume never receives a re-send, and a substitute's
+  accept/reject is ignored. The same identity at a new address is a
+  relocation, not a substitute.
 * Retries of an unconfirmed delivery reuse the same delivery id and checksum,
   so the receiver's idempotency prevents a second acceptance.
 * Restrictions are always derived from the delivery table; nothing is cached,
-  so a restart cannot lose them and a rejection removes only its own entry.
+  so a restart cannot lose them and an *attributed* rejection removes only its
+  own entry. Legacy rows without proven attribution (created before this
+  mechanism) keep their ban with an explicit reason.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
+from dataclasses import dataclass
 from typing import Any
 
 from . import allocator, receiver_client, storage
 from .allocator import RestrictionState, Unsolvable
 
 DELIVERY_GENERATION_KEY = "delivery_generation"
+
+LEGACY_PENDING_REASON = (
+    "旧库遗留交付缺少接收方归属，无法证明原接收方，按安全策略保留禁入测试"
+)
+LEGACY_REJECTED_REASON = (
+    "旧库拒收记录无法证明来自原接收方，拒收不予采纳，保留禁入测试"
+)
 
 
 class ServiceError(Exception):
@@ -56,23 +74,44 @@ def _bump_delivery_generation(conn: sqlite3.Connection) -> None:
     storage.set_setting(conn, DELIVERY_GENERATION_KEY, str(_delivery_generation(conn) + 1))
 
 
-def restriction_sets(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
-    """(accepted, uncertain) slide ids, derived from every delivery row."""
+def restriction_sets(conn: sqlite3.Connection) -> tuple[set[str], set[str], dict[str, str]]:
+    """(accepted, uncertain, reason_overrides) derived from every delivery row.
+
+    Attribution rules
+    -----------------
+    * accepted                    -> permanent ban (kept forever, legacy or not);
+    * pending                     -> temporary ban; legacy rows without a
+                                     recorded receiver stay banned with an
+                                     explicit "unprovable receiver" reason;
+    * rejected with attribution   -> the original receiver's terminal rejection
+                                     lifts only its own restriction;
+    * rejected without attribution (legacy) -> the rejection cannot be proven
+                                     to come from the original receiver, so the
+                                     ban is kept with an explicit reason.
+    """
     accepted: set[str] = set()
     uncertain: set[str] = set()
-    for d in conn.execute("SELECT id, status FROM deliveries"):
+    overrides: dict[str, str] = {}
+    for d in conn.execute("SELECT * FROM deliveries"):
         ids = storage.delivery_slide_ids(conn, d["id"])
         if d["status"] == "accepted":
             accepted |= ids
         elif d["status"] == "pending":
             uncertain |= ids
-    return accepted, uncertain
+            if not d["receiver_url"]:
+                for sid in ids:
+                    overrides.setdefault(sid, LEGACY_PENDING_REASON)
+        elif d["status"] == "rejected" and not d["receiver_id"]:
+            uncertain |= ids
+            for sid in ids:
+                overrides.setdefault(sid, LEGACY_REJECTED_REASON)
+    return accepted, uncertain, overrides
 
 
 def current_restrictions(conn: sqlite3.Connection) -> RestrictionState:
     slides = storage.all_slides(conn)
-    accepted, uncertain = restriction_sets(conn)
-    return allocator.compute_restrictions(slides, accepted, uncertain)
+    accepted, uncertain, overrides = restriction_sets(conn)
+    return allocator.compute_restrictions(slides, accepted, uncertain, overrides)
 
 
 def refresh_plans(conn: sqlite3.Connection) -> None:
@@ -83,8 +122,8 @@ def refresh_plans(conn: sqlite3.Connection) -> None:
     downloads, and are restored automatically once they pass again.
     """
     slides = storage.all_slides(conn)
-    accepted, uncertain = restriction_sets(conn)
-    restrictions = allocator.compute_restrictions(slides, accepted, uncertain)
+    accepted, uncertain, overrides = restriction_sets(conn)
+    restrictions = allocator.compute_restrictions(slides, accepted, uncertain, overrides)
     for plan in storage.list_plans(conn):
         membership = storage.plan_membership(conn, int(plan["id"]))
         frozen = storage.plan_slides(conn, int(plan["id"]))
@@ -137,12 +176,19 @@ def publish_plan(
 ) -> dict[str, Any]:
     with storage.read_snapshot(conn):
         slides = storage.all_slides(conn)
-        accepted, uncertain = restriction_sets(conn)
+        accepted, uncertain, overrides = restriction_sets(conn)
         generation = _delivery_generation(conn)
         snapshot_fingerprint = allocator.fingerprint(slides)
 
     try:
-        result = allocator.solve(slides, accepted, uncertain, req_benign, req_malignant)
+        result = allocator.solve(
+            slides,
+            accepted,
+            uncertain,
+            req_benign,
+            req_malignant,
+            uncertain_reasons=overrides,
+        )
     except Unsolvable as exc:
         with storage.transaction(conn):
             storage.log_event(conn, "plan_unsolvable", f"无法划分：{exc.reason}")
@@ -280,7 +326,12 @@ def _latest_attempt(conn: sqlite3.Connection, plan_id: int, checksum: str) -> di
 def start_delivery(
     conn: sqlite3.Connection, plan_id: int, receiver_url: str, timeout: float = 10.0
 ) -> dict[str, Any]:
-    """Register a pending verification record, then POST the frozen train list."""
+    """Register a pending record, establish receiver identity, then POST.
+
+    The receiver's persistent instance identity is fetched and stored on the
+    pending row *before* any content leaves this service, so a later address
+    change or receiver-volume swap can never turn a substitute into the owner.
+    """
     rows, checksum = _train_content(conn, plan_id)
 
     with storage.transaction(conn):
@@ -299,11 +350,16 @@ def start_delivery(
                 "message": f"该训练名单已被终态接纳（回执 {latest['receipt_ref']}），不会重复发送。",
             }
         if latest and latest["status"] == "pending":
+            hint = (
+                ""
+                if latest["receiver_url"]
+                else "该交付为旧库无归属记录，无法核实或重发，相关切片保持禁入。"
+            )
             return {
                 "delivery": latest,
                 "outcome": None,
                 "reused": True,
-                "message": f"已存在待核实交付 {latest['id']}，请先核实或重试，未重复登记。",
+                "message": f"已存在待核实交付 {latest['id']}，请先核实或重试，未重复登记。{hint}",
             }
         attempt = (latest["attempt"] + 1) if latest else 1
         delivery_id = _delivery_id(plan_id, checksum, attempt)
@@ -316,6 +372,7 @@ def start_delivery(
                 checksum=checksum,
                 attempt=attempt,
                 rows=rows,
+                receiver_url=receiver_url,
             )
         except sqlite3.IntegrityError:
             # A concurrent request registered the same attempt first. That
@@ -328,9 +385,20 @@ def start_delivery(
             conn,
             "delivery_pending",
             f"名单 #{plan_id} 训练名单（{len(rows)} 张）登记为待核实交付 {delivery_id}，"
-            f"发送前状态已落库。",
+            f"归属接收地址 {receiver_url}，发送前状态已落库。",
         )
         refresh_plans(conn)
+
+    # Establish the receiver's identity BEFORE any content leaves.
+    ident = receiver_client.fetch_identity(receiver_url, timeout=timeout)
+    if not ident.receiver_id:
+        outcome = receiver_client.DeliveryOutcome(
+            state="unknown",
+            error=f"未能确认接收方身份（{ident.error}），训练名单未发送。",
+        )
+        return _apply_outcome(conn, delivery_id, outcome, origin="send")
+    with storage.transaction(conn):
+        storage.set_delivery_receiver_id(conn, delivery_id, ident.receiver_id)
 
     outcome = receiver_client.send_delivery(
         receiver_url, delivery_id, checksum, rows, timeout=timeout
@@ -338,9 +406,95 @@ def start_delivery(
     return _apply_outcome(conn, delivery_id, outcome, origin="send")
 
 
-def verify_delivery(
-    conn: sqlite3.Connection, delivery_id: str, receiver_url: str, timeout: float = 10.0
+@dataclass
+class _Route:
+    """Where an existing delivery may be contacted (None => do not send)."""
+
+    url: str | None
+    reason: str = ""
+
+
+def _route_for_delivery(
+    conn: sqlite3.Connection,
+    delivery: dict[str, Any],
+    current_url: str,
+    timeout: float,
+) -> _Route:
+    """Resolve the receiver an old delivery may be confirmed/continued with.
+
+    * no recorded URL            -> legacy row, receiver unprovable: frozen;
+    * URL but no identity yet    -> nothing was ever sent (identity is always
+                                    captured before content), so the current
+                                    address may be used to start it;
+    * URL + identity             -> only a receiver proving the same identity
+                                    qualifies. The recorded address is tried
+                                    first; the current address is accepted only
+                                    if the identity matches (a relocation, not
+                                    a substitute). Anything else is blocked.
+    """
+    recorded_url = delivery["receiver_url"]
+    receiver_id = delivery["receiver_id"]
+    if not recorded_url:
+        return _Route(
+            None,
+            "该交付创建于交付归属机制之前，无法证明原接收方；"
+            "按安全策略保留禁入，不再核实或重发。",
+        )
+    if not receiver_id:
+        return _Route(current_url or recorded_url)
+
+    candidates = [recorded_url]
+    if current_url and current_url != recorded_url:
+        candidates.append(current_url)
+    problems: list[str] = []
+    for url in candidates:
+        ident = receiver_client.fetch_identity(url, timeout=timeout)
+        if ident.receiver_id == receiver_id:
+            if url != recorded_url:
+                with storage.transaction(conn):
+                    storage.set_delivery_receiver_url(conn, delivery["id"], url)
+                    storage.log_event(
+                        conn,
+                        "receiver_relocated",
+                        f"交付 {delivery['id']} 的原接收方身份一致（{receiver_id[:12]}…），"
+                        f"归属地址迁移：{recorded_url} → {url}。",
+                    )
+            return _Route(url)
+        if ident.receiver_id:
+            problems.append(
+                f"{url} 的接收方身份不符（可能更换了接收数据卷或指向其他接收服务）"
+            )
+        else:
+            problems.append(f"{url} 不可达（{ident.error}）")
+    return _Route(
+        None,
+        "；".join(problems) + "。已阻止向替代方重发，交付保持待核实，相关切片继续禁入测试。",
+    )
+
+
+def _blocked_result(
+    conn: sqlite3.Connection, delivery_id: str, reason: str, action: str
 ) -> dict[str, Any]:
+    with storage.transaction(conn):
+        storage.touch_delivery(
+            conn, delivery_id, receiver_status="unknown", error=reason[:300]
+        )
+        storage.log_event(
+            conn, "delivery_blocked", f"交付 {delivery_id} {action}被阻止：{reason}"
+        )
+        refreshed = storage.get_delivery(conn, delivery_id)
+    return {
+        "delivery": refreshed,
+        "outcome": None,
+        "reused": False,
+        "message": f"交付 {delivery_id} 未{action}：{reason}",
+    }
+
+
+def verify_delivery(
+    conn: sqlite3.Connection, delivery_id: str, current_url: str, timeout: float = 10.0
+) -> dict[str, Any]:
+    """Re-query a pending delivery, only ever at its owning receiver."""
     delivery = storage.get_delivery(conn, delivery_id)
     if not delivery:
         raise ServiceError(f"交付 {delivery_id} 不存在。")
@@ -351,15 +505,19 @@ def verify_delivery(
             "reused": True,
             "message": f"该交付已是终态 {delivery['status']}，不会因核实而改变。",
         }
+    route = _route_for_delivery(conn, delivery, current_url, timeout)
+    if route.url is None:
+        return _blocked_result(conn, delivery_id, route.reason, action="核实")
     outcome = receiver_client.query_delivery(
-        receiver_url, delivery_id, delivery["checksum"], timeout=timeout
+        route.url, delivery_id, delivery["checksum"], timeout=timeout
     )
     return _apply_outcome(conn, delivery_id, outcome, origin="verify")
 
 
 def retry_delivery(
-    conn: sqlite3.Connection, delivery_id: str, receiver_url: str, timeout: float = 10.0
+    conn: sqlite3.Connection, delivery_id: str, current_url: str, timeout: float = 10.0
 ) -> dict[str, Any]:
+    """Re-send a pending delivery, only ever to its owning receiver."""
     delivery = storage.get_delivery(conn, delivery_id)
     if not delivery:
         raise ServiceError(f"交付 {delivery_id} 不存在。")
@@ -376,8 +534,23 @@ def retry_delivery(
     ]
     if not rows:
         raise ServiceError("交付的冻结内容缺失，无法重试。")
+    route = _route_for_delivery(conn, delivery, current_url, timeout)
+    if route.url is None:
+        return _blocked_result(conn, delivery_id, route.reason, action="重发")
+    if not delivery["receiver_id"]:
+        # Identity was never established (interrupted before the first send),
+        # so no content has ever left; adopt this receiver's identity first.
+        ident = receiver_client.fetch_identity(route.url, timeout=timeout)
+        if not ident.receiver_id:
+            outcome = receiver_client.DeliveryOutcome(
+                state="unknown",
+                error=f"未能确认接收方身份（{ident.error}），未重发。",
+            )
+            return _apply_outcome(conn, delivery_id, outcome, origin="retry")
+        with storage.transaction(conn):
+            storage.set_delivery_receiver_id(conn, delivery_id, ident.receiver_id)
     outcome = receiver_client.send_delivery(
-        receiver_url, delivery_id, delivery["checksum"], rows, timeout=timeout
+        route.url, delivery_id, delivery["checksum"], rows, timeout=timeout
     )
     return _apply_outcome(conn, delivery_id, outcome, origin="retry")
 
@@ -392,6 +565,38 @@ def _apply_outcome(
         delivery = storage.get_delivery(conn, delivery_id)
         if not delivery:
             raise ServiceError(f"交付 {delivery_id} 不存在。")
+        # Attribution guard: a response from a non-owner receiver never applies.
+        if outcome.receiver_id:
+            if (
+                delivery["receiver_id"]
+                and outcome.receiver_id != delivery["receiver_id"]
+            ):
+                storage.touch_delivery(
+                    conn,
+                    delivery_id,
+                    receiver_status="unknown",
+                    error="响应来自非归属接收方（身份不符），已忽略。",
+                )
+                storage.log_event(
+                    conn,
+                    "delivery_blocked",
+                    f"交付 {delivery_id} 的{origin}响应来自身份不符的接收方"
+                    f"（{outcome.receiver_id[:12]}… ≠ 归属 "
+                    f"{delivery['receiver_id'][:12]}…），已忽略；保持待核实。",
+                )
+                refreshed = storage.get_delivery(conn, delivery_id)
+                return {
+                    "delivery": refreshed,
+                    "outcome": outcome,
+                    "reused": False,
+                    "message": f"交付 {delivery_id} 的响应来自非归属接收方，已忽略；"
+                    "交付保持待核实，相关切片继续禁入测试。",
+                }
+            if not delivery["receiver_id"]:
+                storage.set_delivery_receiver_id(
+                    conn, delivery_id, outcome.receiver_id
+                )
+                delivery = storage.get_delivery(conn, delivery_id)
         if outcome.state in {"accepted", "rejected"} and delivery["status"] == "pending":
             payload = json.dumps(
                 outcome.payload or {}, ensure_ascii=False, sort_keys=True
@@ -413,6 +618,8 @@ def _apply_outcome(
             )
             refresh_plans(conn)
             message = f"交付 {delivery_id} 已确认终态：{_cn(outcome.state)}，回执 {outcome.receipt_ref}。"
+            if outcome.state == "rejected" and not delivery["receiver_id"]:
+                message += "（回执缺少接收方身份，该拒收不解除禁入。）"
         elif outcome.state in {"accepted", "rejected"}:
             storage.log_event(
                 conn,
@@ -461,20 +668,39 @@ def startup_reconcile(
     Re-judging is unconditional because a crash may have happened after an
     upload or delivery change but before the plan status rows were refreshed.
     Re-querying never deletes a restriction: a missing record or timeout keeps
-    the delivery pending/unknown.
+    the delivery pending/unknown. Each pending delivery is queried at its
+    *owning* receiver only; legacy rows without attribution are reported and
+    keep their ban.
     """
     with storage.transaction(conn):
         refresh_plans(conn)
+        legacy = [
+            d
+            for d in storage.list_deliveries(conn)
+            if not d["receiver_url"] and d["status"] in ("pending", "rejected")
+        ]
+        if legacy:
+            ids = "、".join(d["id"] for d in legacy[:5]) + ("…" if len(legacy) > 5 else "")
+            storage.log_event(
+                conn,
+                "legacy_deliveries",
+                f"{len(legacy)} 条旧库交付（{ids}）无接收方归属，无法证明原接收方，"
+                "按安全策略保留禁入；其中的拒收不予采纳。",
+            )
     return reconcile_pending(conn, receiver_url, timeout=timeout)
 
 
 def reconcile_pending(
     conn: sqlite3.Connection, receiver_url: str, timeout: float = 2.0
 ) -> list[dict[str, Any]]:
-    """Only re-query pending deliveries; never drops a restriction."""
+    """Re-query pending deliveries at their owning receivers.
+
+    Never drops a restriction, and one unreachable owner never blocks the
+    others (each delivery is reconciled independently).
+    """
     results = []
     for d in storage.list_deliveries(conn):
-        if d["status"] != "pending":
+        if d["status"] != "pending" or not d["receiver_url"]:
             continue
         try:
             results.append(verify_delivery(conn, d["id"], receiver_url, timeout=timeout))
